@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() { echo "Usage: $0 MASTER_M3U8_URL AES128_KEY OUTPUT_TITLE"; exit 1; }
+[[ $# -ne 3 ]] && usage
+
+MASTER_URL="$1"
+KEY="$2"
+TITLE="$3"
+
+# Clean: keep alphanum/underscore, replace others with _
+SAFE_TITLE="$(echo "$TITLE" | sed 's/[^A-Za-z0-9]/_/g')"
+OUT="${SAFE_TITLE}.mp4"
+
+# Always use cwd for temp files and output!
+PARENT_DIR="$(pwd)"
+TMPDIR="$PARENT_DIR/hls_temp_$$"
+mkdir -p "$TMPDIR"
+cd "$TMPDIR"
+echo "🔗 Temp directory: $TMPDIR"
+
+for cmd in curl aria2c ffmpeg openssl grep sed awk; do
+  command -v "$cmd" >/dev/null || { echo "Missing $cmd"; exit 1; }
+done
+
+echo "Downloading master playlist..."
+curl -fsS "$MASTER_URL" -o master.m3u8
+
+best_line=$(grep -n '#EXT-X-STREAM-INF:' master.m3u8 | while IFS=: read -r idx line; do
+  bw=$(echo "$line" | grep -o 'BANDWIDTH=[0-9]\+' | cut -d= -f2)
+  echo "$bw $idx"
+done | sort -nr | head -1)
+best_idx=$(echo "$best_line" | awk '{print $2}')
+
+stream_inf=$(sed -n "${best_idx}p" master.m3u8)
+video_pl=$(sed -n "$((best_idx+1))p" master.m3u8)
+audio_gid=$(echo "$stream_inf" | grep -o 'AUDIO="[^"]*"' | cut -d'"' -f2)
+audio_pl=$(grep "#EXT-X-MEDIA:TYPE=AUDIO" master.m3u8 | grep "GROUP-ID=\"$audio_gid\"" | grep -o 'URI="[^"]*"' | cut -d'"' -f2)
+
+BASEURL="${MASTER_URL%/*}/"
+
+curl -fsS "${BASEURL}${video_pl}" -o video.m3u8
+curl -fsS "${BASEURL}${audio_pl}" -o audio.m3u8
+
+get_urls() {
+  grep -o '^[^#].*\.ts' "$1" | awk -v b="$2" '{print b $0}'
+}
+
+CORES=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 8)
+JOBS=$((CORES * 4))
+XS=$((CORES * 2))
+
+echo "Downloading video segments (parallel $JOBS threads)..."
+get_urls video.m3u8 "$BASEURL" > video_urls.txt
+aria2c --console-log-level=warn -j "$JOBS" -x "$XS" -s "$XS" -i video_urls.txt 1>/dev/null
+
+echo "Downloading audio segments (parallel $JOBS threads)..."
+get_urls audio.m3u8 "$BASEURL" > audio_urls.txt
+aria2c --console-log-level=warn -j "$JOBS" -x "$XS" -s "$XS" -i audio_urls.txt 1>/dev/null
+
+iv=$(grep '#EXT-X-KEY' video.m3u8 | sed -n 's/.*IV=0x\([0-9A-Fa-f]\{32\}\).*/\1/p' | head -1)
+IV="${iv:-00000000000000000000000000000000}"
+
+decrypt_and_prepare_list() {
+  local m3u8="$1"
+  ts_files=( $(grep -o '^[^#].*\.ts' "$m3u8") )
+  echo "Decrypting segments for $m3u8 using all CPUs..."
+  for ts in "${ts_files[@]}"; do
+    openssl aes-128-cbc -d -nosalt -in "$ts" -out "dec_${ts}" -K "$KEY" -iv "$IV" &
+  done
+  wait
+}
+decrypt_and_prepare_list video.m3u8
+decrypt_and_prepare_list audio.m3u8
+
+echo "Concatenating decrypted video segments in playlist order..."
+grep -o '^[^#].*\.ts' video.m3u8 | awk '{print "dec_"$0}' | xargs cat > video_all.ts
+
+echo "Concatenating decrypted audio segments in playlist order..."
+grep -o '^[^#].*\.ts' audio.m3u8 | awk '{print "dec_"$0}' | xargs cat > audio_all.ts
+
+# --- Automatic numbering to avoid overwrite ---
+FNAME="$PARENT_DIR/$OUT"
+BASE="${OUT%.*}"
+EXT="${OUT##*.}"
+i=1
+while [ -e "$FNAME" ]; do
+  FNAME="$PARENT_DIR/${BASE}_$i.$EXT"
+  i=$((i+1))
+done
+
+echo "Muxing final video (audio+video) to MP4..."
+ffmpeg -y -hide_banner -loglevel error -stats -nostdin \
+  -i video_all.ts -i audio_all.ts \
+  -c copy -map 0:v:0 -map 1:a:0 -shortest "$FNAME"
+
+cd "$PARENT_DIR"
+ABSOUT="$(realpath "$FNAME")"
+echo "✅ Done! Final file saved as: $ABSOUT"
+echo "🔗 Temporary/intermediate files directory was: $TMPDIR"
+
+# -- Only delete tmp if you say YES --
+read -p "Delete temporary directory $TMPDIR? [y/N]: " confirm
+if [[ "$confirm" =~ ^[Yy]$ ]]; then
+  rm -rf "$TMPDIR"
+  echo "Temporary directory deleted."
+else
+  echo "Temporary directory kept: $TMPDIR"
+fi
