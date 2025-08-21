@@ -1,0 +1,13 @@
+
+Incase only hls_video no audio in index then Change url to hls_500k whatever is available then you can run these commands
+BASE="https://qcdn.spayee.in/spees/w/o/63690b5de4b097305ac9980a/v/665c6798d23de0105da9ffc1/u/63f37b73e4b0a71a3a615ffc/t/5b417d5c8e3f19fd1b91a5a4927a0585/p/assets/videos/63690b5de4b097305ac9980a/2024/06/02/665c6798d23de0105da9ffc1/"
+for i in $(seq -f "%03g" 1 3500); do
+  echo "${BASE}hls_500k_${i}.ts"
+done > segments.txt                               
+  
+aria2c --quiet=true --console-log-level=error -j 16 -x 16 -s 16 -i segments.txt > /dev/null 2>&1
+
+
+KEY=b1bd8ef244fd69df2d174df1253d3988; IV=496daa1c6914000e408c65cead91fc29; ls *.ts | xargs -P$(sysctl -n hw.ncpu) -I{} openssl aes-128-cbc -d -nosalt -in "{}" -out "dec_{}" -K "$KEY" -iv "$IV"
+cat $(ls dec_hls_500k_*.ts | sort -V) > video_all.ts                                  
+ffmpeg -i video_all.ts -c:v libx264 -crf 18 -preset slow -c:a aac -b:a 192k output.mp4
